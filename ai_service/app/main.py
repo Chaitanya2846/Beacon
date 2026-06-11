@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import fitz  # PyMuPDF
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from bson.objectid import ObjectId
@@ -14,6 +15,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Support Platform - Local Embedding Microservice")
+
+app = FastAPI(title="AI Support Platform - Local Embedding Microservice")
+
+# --- ADD THIS ENTIRE BLOCK ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (perfect for local development)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (POST, GET, OPTIONS, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+# -----------------------------
+
+# ... your endpoints continue below ...
 
 # ==========================================
 # MODEL SCHEMAS
