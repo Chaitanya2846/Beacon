@@ -7,6 +7,7 @@ from bson.objectid import ObjectId
 import logging
 import google.generativeai as genai
 import uuid
+from datetime import datetime
 
 from app.config import db, embedding_model
 
@@ -43,7 +44,7 @@ async def ingest_document(
     logger.info(f"Received file: {file.filename} for Org: {organizationId}")
     
     try:
-        # 1. Read the PDF File directly from memory (No saving to disk!)
+        # 1. Read the PDF File directly from memory
         pdf_bytes = await file.read()
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         
@@ -69,10 +70,19 @@ async def ingest_document(
         logger.info("Generating vectors locally...")
         embeddings = embedding_model.encode(chunks).tolist()
         
-        # 4. Batch Upload directly to MongoDB Atlas
-        documents_to_insert = []
-        document_id = str(uuid.uuid4()) # Generate a unique ID for this document
+        # 4. Create Master Document Record for UI tracking
+        document_id = str(uuid.uuid4())
+        doc_record = {
+            "organization_id": ObjectId(organizationId),
+            "document_id": document_id,
+            "file_name": file.filename,
+            "status": "SUCCESS",
+            "timestamp": datetime.utcnow()
+        }
+        db["documents"].insert_one(doc_record)
 
+        # 5. Batch Upload chunks directly to MongoDB Atlas
+        documents_to_insert = []
         for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             documents_to_insert.append({
                 "organization_id": ObjectId(organizationId),
@@ -80,7 +90,7 @@ async def ingest_document(
                 "file_name": file.filename,
                 "chunk_index": idx,
                 "content": chunk,
-                "embedding": embedding  # These are 384 dimensions
+                "embedding": embedding  # 384 dimensions
             })
             
         if documents_to_insert:
@@ -103,12 +113,18 @@ async def chat_with_knowledge_base(payload: ChatRequest):
     logger.info(f"User Question: {payload.question}")
     
     try:
-        # 1. Convert the user's question into a vector locally
+        # 1. Save User Question to history immediately
+        db["chat_history"].insert_one({
+            "organization_id": ObjectId(payload.organizationId),
+            "role": "user",
+            "text": payload.question,
+            "timestamp": datetime.utcnow()
+        })
+
+        # 2. Convert the user's question into a vector locally
         question_vector = embedding_model.encode(payload.question).tolist()
         
-        # 2. Execute Atlas Vector Search
-        # Adjusted: Pulling candidates first and matching by organization_id sequentially 
-        # to circumvent Atlas index string/object type parsing constraints.
+        # 3. Execute Atlas Vector Search
         pipeline = [
             {
                 "$vectorSearch": {
@@ -139,7 +155,7 @@ async def chat_with_knowledge_base(payload: ChatRequest):
         results = list(db["chunks"].aggregate(pipeline))
         logger.info(f"Vector Search matched {len(results)} documents.")
         
-        # 3. Compile the retrieved chunks into a single context string
+        # 4. Compile the retrieved chunks into a single context string
         context_str = ""
         for idx, doc in enumerate(results):
             logger.info(f"Matched Doc {idx+1} (Score: {doc.get('score')}): {doc['content'][:50]}...")
@@ -149,7 +165,7 @@ async def chat_with_knowledge_base(payload: ChatRequest):
             logger.warning("Vector search returned zero results for this context window.")
             context_str = "No specific reference documents found in the database matching this query."
 
-        # 4. Engineer the prompt instructing Gemini to act as an elite support agent
+        # 5. Engineer the prompt instructing Gemini to act as an elite support agent
         system_instruction = (
             "You are an elite AI support agent. Your goal is to answer the customer's question "
             "truthfully and concisely using ONLY the provided context below. If the answer cannot be found "
@@ -157,7 +173,7 @@ async def chat_with_knowledge_base(payload: ChatRequest):
             f"Context from internal knowledge base:\n{context_str}"
         )
         
-        # 5. Generate the answer using Gemini Flash with Graceful Error Handling
+        # 6. Generate the answer using Gemini Flash with Graceful Error Handling
         model = genai.GenerativeModel(model_name='gemini-2.5-flash')
         full_prompt = f"{system_instruction}\n\nUser Question: {payload.question}"
         
@@ -171,14 +187,76 @@ async def chat_with_knowledge_base(payload: ChatRequest):
             else:
                 answer_text = "An error occurred while generating a response. Please try again."
         
+        sources_used = [{"id": str(r["_id"]), "score": r.get("score", 0)} for r in results]
+
+        # 7. Save Assistant Answer to history
+        db["chat_history"].insert_one({
+            "organization_id": ObjectId(payload.organizationId),
+            "role": "assistant",
+            "text": answer_text,
+            "sources": sources_used,
+            "timestamp": datetime.utcnow()
+        })
+
         logger.info(f"--- CHAT DEBUG END ---")
         
         return {
             "answer": answer_text,
-            "sources_used": [{"id": str(r["_id"]), "score": r.get("score", 0)} for r in results]
+            "sources_used": sources_used
         }
         
     except Exception as e:
         logger.error(f"Chat execution exception occurred: {str(e)}")
         logger.info(f"--- CHAT DEBUG END WITH ERROR ---")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# ENDPOINT 3: FETCH PERSISTENT CHAT HISTORY
+# ==========================================
+@app.get("/api/v1/ai/chat/{organizationId}")
+async def get_chat_history(organizationId: str):
+    try:
+        # Fetch all history messages sorted oldest to newest
+        history = list(db["chat_history"].find(
+            {"organization_id": ObjectId(organizationId)}
+        ).sort("timestamp", 1))
+        
+        formatted_history = []
+        for msg in history:
+            formatted_history.append({
+                "role": msg.get("role"),
+                "text": msg.get("text"),
+                "sources": msg.get("sources", [])
+            })
+            
+        return formatted_history
+    except Exception as e:
+        logger.error(f"Failed to fetch chat history: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# ENDPOINT 4: FETCH PERSISTENT DOCUMENTS
+# ==========================================
+@app.get("/api/v1/ai/documents/{organizationId}")
+async def get_documents(organizationId: str):
+    try:
+        # Fetch documents sorted newest first
+        docs = list(db["documents"].find(
+            {"organization_id": ObjectId(organizationId)}
+        ).sort("timestamp", -1))
+        
+        formatted_docs = []
+        for doc in docs:
+            formatted_docs.append({
+                "id": str(doc["_id"]),
+                "name": doc.get("file_name", "Unnamed Document"),
+                "status": doc.get("status", "SUCCESS"),
+                "date": doc.get("timestamp", datetime.utcnow()).strftime("%Y-%m-%d")
+            })
+            
+        return formatted_docs
+    except Exception as e:
+        logger.error(f"Failed to fetch documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

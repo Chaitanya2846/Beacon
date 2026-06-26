@@ -1,4 +1,4 @@
-import React, { useState, useContext, useRef } from 'react';
+import React, { useState, useContext, useRef, useEffect } from 'react';
 import { AuthContext } from '../context/AuthContext';
 
 // ==========================================
@@ -7,13 +7,27 @@ import { AuthContext } from '../context/AuthContext';
 const KnowledgeBaseManager = ({ orgId }) => {
   const fileInputRef = useRef(null);
   
-  const [documents, setDocuments] = useState([
-    { id: "doc_01", name: "Novatra_1.0_Guidelines.pdf", status: "COMPLETED", date: "2026-06-11" },
-    { id: "doc_02", name: "Tourist_Safety_FAQ.pdf", status: "COMPLETED", date: "2026-06-10" }
-  ]);
-  
+  // Start with an empty array instead of dummy data
+  const [documents, setDocuments] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState({ type: null, message: '' });
+
+  // Fetch documents on mount (Persists PDFs across refreshes)
+  useEffect(() => {
+    const fetchDocuments = async () => {
+      if (!orgId || orgId === "No Org Linked") return;
+      try {
+        const res = await fetch(`http://127.0.0.1:8000/api/v1/ai/documents/${orgId}`);
+        if (res.ok) {
+          const data = await res.json();
+          setDocuments(data);
+        }
+      } catch (error) {
+        console.error("Failed to fetch documents:", error);
+      }
+    };
+    fetchDocuments();
+  }, [orgId]);
 
   // Triggers the hidden file input
   const handleDropzoneClick = () => {
@@ -172,6 +186,7 @@ const KnowledgeBaseManager = ({ orgId }) => {
 // COMPONENT 2: INTERACTIVE CHAT PLAYGROUND
 // ==========================================
 const ChatPlayground = ({ orgId }) => {
+  // Chat resets to this default greeting on every page load/refresh
   const [messages, setMessages] = useState([
     { role: 'system', text: 'Hello! I am your AI Knowledge Base assistant. Ask me anything based on your uploaded documentation.' }
   ]);
