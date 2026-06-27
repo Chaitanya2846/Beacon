@@ -5,9 +5,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from bson.objectid import ObjectId
 import logging
-import google.generativeai as genai
 import uuid
 from datetime import datetime
+import os
+
+# Import official Groq client
+from groq import Groq
 
 from app.config import db, embedding_model
 
@@ -16,6 +19,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Support Platform - Local Embedding Microservice")
+
+# Initialize Groq Client
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    logger.warning("GROQ_API_KEY is not set in environment variables!")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # --- CORS MIDDLEWARE ---
 app.add_middleware(
@@ -90,7 +99,7 @@ async def ingest_document(
                 "file_name": file.filename,
                 "chunk_index": idx,
                 "content": chunk,
-                "embedding": embedding  # 384 dimensions
+                "embedding": embedding  
             })
             
         if documents_to_insert:
@@ -106,6 +115,9 @@ async def ingest_document(
 # ==========================================
 # ENDPOINT 2: CHAT RETRIEVAL & GENERATION (RAG)
 # ==========================================
+# ==========================================
+# ENDPOINT 2: CHAT RETRIEVAL & GENERATION (RAG)
+# ==========================================
 @app.post("/api/v1/ai/chat")
 async def chat_with_knowledge_base(payload: ChatRequest):
     logger.info(f"--- CHAT DEBUG START ---")
@@ -113,7 +125,16 @@ async def chat_with_knowledge_base(payload: ChatRequest):
     logger.info(f"User Question: {payload.question}")
     
     try:
-        # 1. Save User Question to history immediately
+        # 1. Fetch Recent Chat History (Conversational Memory)
+        # Grab the last 6 messages (3 turns) to give the AI context for pronouns (it, they, he)
+        recent_history_cursor = db["chat_history"].find(
+            {"organization_id": ObjectId(payload.organizationId)}
+        ).sort("timestamp", -1).limit(6)
+        
+        # Reverse the list so it is chronological (oldest to newest)
+        recent_history = list(recent_history_cursor)[::-1]
+
+        # 2. Save Current User Question to history immediately
         db["chat_history"].insert_one({
             "organization_id": ObjectId(payload.organizationId),
             "role": "user",
@@ -121,27 +142,24 @@ async def chat_with_knowledge_base(payload: ChatRequest):
             "timestamp": datetime.utcnow()
         })
 
-        # 2. Convert the user's question into a vector locally
+        # 3. Convert the user's question into a vector locally
         question_vector = embedding_model.encode(payload.question).tolist()
         
-        # 3. Execute Atlas Vector Search
+        # 4. Execute Atlas Vector Search (Upgraded Parameters)
         pipeline = [
             {
                 "$vectorSearch": {
                     "index": "vector_index",
                     "path": "embedding",
                     "queryVector": question_vector,
-                    "numCandidates": 100, 
-                    "limit": 10
+                    "numCandidates": 150, # Increased for wider net
+                    "limit": 12           # Increased to 12 chunks for Multi-Hop Summaries
                 }
             },
             {
                 "$match": {
                     "organization_id": ObjectId(payload.organizationId)
                 }
-            },
-            {
-                "$limit": 3
             },
             {
                 "$project": {
@@ -155,41 +173,55 @@ async def chat_with_knowledge_base(payload: ChatRequest):
         results = list(db["chunks"].aggregate(pipeline))
         logger.info(f"Vector Search matched {len(results)} documents.")
         
-        # 4. Compile the retrieved chunks into a single context string
+        # 5. Compile the retrieved chunks into a single context string
         context_str = ""
         for idx, doc in enumerate(results):
-            logger.info(f"Matched Doc {idx+1} (Score: {doc.get('score')}): {doc['content'][:50]}...")
             context_str += f"[Document Source {idx+1}]:\n{doc['content']}\n\n"
             
         if not context_str:
-            logger.warning("Vector search returned zero results for this context window.")
             context_str = "No specific reference documents found in the database matching this query."
 
-        # 5. Engineer the prompt instructing Gemini to act as an elite support agent
+        # 6. Elite-Level System Prompting
+        # This explicitly instructs Llama-3 to use history, recognize synonyms, and handle multi-hop logic.
+        # 6. Elite-Level System Prompting (ZERO HALLUCINATION STRICTNESS)
         system_instruction = (
-            "You are an elite AI support agent. Your goal is to answer the customer's question "
-            "truthfully and concisely using ONLY the provided context below. If the answer cannot be found "
-            "in the context, politely state that you don't have that information.\n\n"
-            f"Context from internal knowledge base:\n{context_str}"
+            "You are an elite AI support agent representing this organization. Your primary duty is to answer the user's questions based STRICTLY and ONLY on the provided Context and the Conversation History.\n\n"
+            "--- BEHAVIOR GUIDELINES ---\n"
+            "1. ZERO HALLUCINATION: You are forbidden from using external knowledge. Do not invent examples, do not explain rules unless the explanation is explicitly in the text, and do not add context outside the provided chunks. Use the exact terminology found in the document.\n"
+            "2. CONFIDENT RETRIEVAL: Use the retrieved context to answer. If the answer is present in the retrieved context, answer confidently. Do not refuse to answer if the context clearly states the fact.\n"
+            "3. CONVERSATIONAL MEMORY: Use the previous messages in the chat history to understand context, follow-up questions, and pronouns (e.g., 'it', 'they', 'their').\n"
+            "4. SYNONYMS & INTENT: Recognize semantic synonyms (e.g., 'irrigate' means 'water'), but when generating your answer, use the literal document wording.\n"
+            "5. GREETINGS: If the user says hello or makes small talk, respond warmly and ask how you can help them.\n"
+            "6. FALLBACK: If the exact answer cannot be reasonably deduced from the context, you MUST say exactly: 'I couldn't find this information in the uploaded knowledge base. Would you like me to connect you with a human agent?' Do not attempt to guess.\n\n"
+            f"--- KNOWLEDGE BASE CONTEXT ---\n{context_str}"
         )
         
-        # 6. Generate the answer using Gemini Flash with Graceful Error Handling
-        model = genai.GenerativeModel(model_name='gemini-2.5-flash')
-        full_prompt = f"{system_instruction}\n\nUser Question: {payload.question}"
+        # 7. Build the Messages Array for Groq
+        messages_for_groq = [{"role": "system", "content": system_instruction}]
         
+        # Append historical messages
+        for msg in recent_history:
+            messages_for_groq.append({"role": msg["role"], "content": msg["text"]})
+            
+        # Append the current question
+        messages_for_groq.append({"role": "user", "content": payload.question})
+
+        # 8. Generate answer using Groq
         try:
-            response = model.generate_content(full_prompt)
-            answer_text = response.text
-        except Exception as gemini_err:
-            logger.error(f"Gemini API Error: {str(gemini_err)}")
-            if "429" in str(gemini_err) or "quota" in str(gemini_err).lower():
-                answer_text = "⚠️ The system is currently experiencing high demand. Please wait a few seconds and try your question again."
-            else:
-                answer_text = "An error occurred while generating a response. Please try again."
+            completion = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages_for_groq,
+                temperature=0.2, # Kept low for factual accuracy
+                max_tokens=1000
+            )
+            answer_text = completion.choices[0].message.content
+        except Exception as groq_err:
+            logger.error(f"Groq API Error: {str(groq_err)}")
+            answer_text = "⚠️ An error occurred while generating a response from Groq. Please verify your API key and try again."
         
         sources_used = [{"id": str(r["_id"]), "score": r.get("score", 0)} for r in results]
 
-        # 7. Save Assistant Answer to history
+        # 9. Save Assistant Answer to history
         db["chat_history"].insert_one({
             "organization_id": ObjectId(payload.organizationId),
             "role": "assistant",
@@ -199,7 +231,6 @@ async def chat_with_knowledge_base(payload: ChatRequest):
         })
 
         logger.info(f"--- CHAT DEBUG END ---")
-        
         return {
             "answer": answer_text,
             "sources_used": sources_used
@@ -207,7 +238,6 @@ async def chat_with_knowledge_base(payload: ChatRequest):
         
     except Exception as e:
         logger.error(f"Chat execution exception occurred: {str(e)}")
-        logger.info(f"--- CHAT DEBUG END WITH ERROR ---")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -217,7 +247,6 @@ async def chat_with_knowledge_base(payload: ChatRequest):
 @app.get("/api/v1/ai/chat/{organizationId}")
 async def get_chat_history(organizationId: str):
     try:
-        # Fetch all history messages sorted oldest to newest
         history = list(db["chat_history"].find(
             {"organization_id": ObjectId(organizationId)}
         ).sort("timestamp", 1))
@@ -229,10 +258,8 @@ async def get_chat_history(organizationId: str):
                 "text": msg.get("text"),
                 "sources": msg.get("sources", [])
             })
-            
         return formatted_history
     except Exception as e:
-        logger.error(f"Failed to fetch chat history: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -242,7 +269,6 @@ async def get_chat_history(organizationId: str):
 @app.get("/api/v1/ai/documents/{organizationId}")
 async def get_documents(organizationId: str):
     try:
-        # Fetch documents sorted newest first
         docs = list(db["documents"].find(
             {"organization_id": ObjectId(organizationId)}
         ).sort("timestamp", -1))
@@ -255,8 +281,6 @@ async def get_documents(organizationId: str):
                 "status": doc.get("status", "SUCCESS"),
                 "date": doc.get("timestamp", datetime.utcnow()).strftime("%Y-%m-%d")
             })
-            
         return formatted_docs
     except Exception as e:
-        logger.error(f"Failed to fetch documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

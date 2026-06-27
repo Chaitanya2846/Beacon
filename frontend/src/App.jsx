@@ -1,6 +1,6 @@
 import React, { useContext } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-
+import Widget from './pages/Widget';
 // Global Contexts
 import { AuthProvider, AuthContext } from './context/AuthContext';
 
@@ -35,7 +35,7 @@ export default function App() {
           {/* Public Auth Routes */}
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
-          
+          <Route path="/widget/:orgId" element={<Widget />} />
           {/* Secure Workspace Routes */}
           <Route 
             path="/dashboard" 
