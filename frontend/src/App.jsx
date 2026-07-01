@@ -16,13 +16,13 @@ import Overview from './pages/Overview';
 import KnowledgeBase from './pages/KnowledgeBase';
 import Playground from './pages/Playground';
 import WidgetInstall from './pages/WidgetInstall';
+import Conversations from './pages/Conversations';
 
 // Placeholder Components for the new routes (We will build these out in separate files later)
-const AiSettings = () => <div className="p-8 text-slate-500">AI Settings Page Coming Soon...</div>;
-const Conversations = () => <div className="p-8 text-slate-500">Conversations Page Coming Soon...</div>;
-const Analytics = () => <div className="p-8 text-slate-500">Analytics Page Coming Soon...</div>;
-const CompanySettings = () => <div className="p-8 text-slate-500">Company Settings Page Coming Soon...</div>;
-const Profile = () => <div className="p-8 text-slate-500">Profile Page Coming Soon...</div>;
+const AiSettings = ({ orgId }) => <div className="p-8 text-slate-500">AI Settings Component</div>;
+const Analytics = ({ orgId }) => <div className="p-8 text-slate-500">Analytics Component</div>;
+const CompanySettings = ({ orgId }) => <div className="p-8 text-slate-500">Company Settings Component</div>;
+const Profile = ({ orgId }) => <div className="p-8 text-slate-500">Profile Component</div>;
 
 /**
  * ProtectedRoute Component
