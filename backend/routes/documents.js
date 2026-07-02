@@ -23,13 +23,16 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     
     // Note: In production, you would extract the organizationId from the JWT token.
     // For now, we expect it in the form body.
-    const { organizationId } = req.body; 
+    const { organizationId, category, tags, replaceDocumentId } = req.body; 
     if (!organizationId) return res.status(400).json({ error: 'Organization ID is required for tenant isolation.' });
 
     // 2. Prepare the payload for FastAPI
     const formData = new FormData();
     formData.append('file', req.file.buffer, req.file.originalname);
     formData.append('organizationId', organizationId);
+    formData.append('category', category || 'Uncategorized');
+    formData.append('tags', tags || '');
+    if (replaceDocumentId) formData.append('replaceDocumentId', replaceDocumentId);
 
     // 3. Forward the file to your Python AI Microservice
     console.log(`Forwarding ${req.file.originalname} to AI Engine for Org: ${organizationId}...`);
